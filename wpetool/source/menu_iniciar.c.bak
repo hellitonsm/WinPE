@@ -1,0 +1,2239 @@
+/* menu_iniciar.c - Area de trabalho tipo Windows para WinPE.
+   O programa atua como o "shell": cria uma barra de tarefas fixa em baixo
+   com botao Iniciar, atalhos rapidos (CMD, Explorer, Gerenciador) e relogio.
+   O Menu Iniciar fica oculto e abre/sobe acima da barra de tarefas ao clicar
+   no botao Iniciar (ou na tecla Windows), exatamente como no Windows 10/11.
+   Clique num tile ou pasta executa via ShellExecute e recolhe o menu.
+   Compilar (Linux / MinGW-w64):
+     x86_64-w64-mingw32-gcc menu_iniciar.c -o menu_iniciar.exe -mwindows -ladvapi32 -lshell32 -lshlwapi -luser32 -lgdi32
+*/
+
+#define UNICODE
+#define _UNICODE
+#define _WIN32_WINNT 0x0601
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <time.h>
+
+/* IDs de controlo do Menu */
+#define ID_SEARCH       100
+#define ID_POWEROFF     200
+#define ID_REBOOT       201
+#define ID_CLOSE        204
+#define TILE_BASE       300
+
+/* IDs do timer */
+#define IDT_CLOCK       1
+#define IDT_HOVER       2
+
+/* ---------- Explorador de arquivos integrado ---------- */
+#define IDX_PATH      600
+#define IDX_GO        601
+#define IDX_UP        602
+#define IDX_BACK      603
+#define IDX_HOME      604
+#define IDX_REFRESH   605
+#define IDX_LIST      606
+#define IDX_SIDE      607
+#define IDX_STATUS    608
+
+#define EXP_TOOLBAR_H 42
+#define EXP_SIDE_W    186
+#define EXP_STATUS_H  26
+#define EXP_ITEM_H    22
+#define EXP_ICON_H    20
+
+/* Cores do explorador (tema claro, como o Explorer classico) */
+#define E_BG       RGB(240, 240, 240)
+#define E_LISTBG   RGB(255, 255, 255)
+#define E_TEXT     RGB(20, 20, 20)
+#define E_MUTED    RGB(110, 110, 110)
+#define E_SEL      RGB(0, 120, 215)
+#define E_HOT      RGB(229, 241, 255)
+#define E_LINE     RGB(200, 200, 200)
+#define E_DRIVE    RGB(150, 158, 168)
+
+/* Um item (ficheiro, pasta ou unidade). "name" e o rotulo visivel,
+   "path" o caminho real usado na navegacao. */
+typedef struct {
+    WCHAR name[MAX_PATH];
+    WCHAR path[MAX_PATH];
+    DWORD attrs;
+    ULARGE_INTEGER size;
+    FILETIME ft;
+    BOOL isDir;
+    BOOL isDrive;
+} EXPITEM;
+
+/* Estado de cada janela do explorador */
+typedef struct {
+    WCHAR path[MAX_PATH];
+    WCHAR hist[64][MAX_PATH];
+    int histCount, histPos;
+    EXPITEM *items;      /* conteudo da pasta atual */
+    int nItems, capItems;
+    BOOL drivesMode;
+    EXPITEM *places;     /* locais da barra lateral */
+    int nPlaces, capPlaces;
+    int cascade;
+} EXPLORER;
+
+/* Comando interno: abrir o explorador de arquivos do proprio programa */
+#define CMD_EXPLORER  L"#explorer"
+
+/* Rastreio de diagnostico (lido pela caixa de crash) */
+static volatile int g_step = 0;            /* ultimo passo executado */
+static volatile unsigned g_lastMsg = 0;    /* ultima mensagem despachada */
+static volatile unsigned g_lastWp = 0;
+
+/* Diagnostico desenhado na barra de tarefas (lido na captura de tela) */
+static HWND g_hwndTaskbar;                 /* declaracao antecipada (def. abaixo) */
+static char g_dbg[96] = "boot";
+static void DbgSet(const char *s) {
+    lstrcpynA(g_dbg, s, 96);
+    if (g_hwndTaskbar) InvalidateRect(g_hwndTaskbar, NULL, FALSE);
+}
+
+/* Equivalentes de PathFileExists / PathIsDirectory sem depender de shlwapi */
+static BOOL ExpPathExists(const WCHAR *p) {
+    return p && p[0] && GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+}
+static BOOL ExpPathIsDir(const WCHAR *p) {
+    DWORD a = p ? GetFileAttributesW(p) : INVALID_FILE_ATTRIBUTES;
+    return (a != INVALID_FILE_ATTRIBUTES) && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+/* Locais especiais que o explorador sabe abrir (servem de argumento) */
+#define FS_ESTEPC    L"shell:EstePC"
+#define FS_WINDOWS   L"shell:Windows"
+#define FS_SYSTEM32  L"shell:System32"
+#define FS_DRIVERS   L"shell:Drivers"
+#define FS_DESKTOP   L"shell:Desktop"
+#define FS_DOCS      L"shell:Documentos"
+#define FS_IMGENS    L"shell:Imagens"
+
+/* Barra de tarefas */
+#define TASKBAR_H       40
+#define START_BTN_W     48
+#define QUICK_W         38
+
+/* Dimensoes do Menu Iniciar */
+#define HEADER_H        54
+#define RAIL_W          180
+#define TILE_W          120
+#define TILE_H          90
+#define TILE_GAP        12
+#define TILES_ROW       4
+#define WIN_W           720
+#define WIN_H           530
+#define RAIL_ITEM_H     30
+#define RAIL_TOP        (HEADER_H + 46)
+#define POWER_TOP       (WIN_H - 86)
+
+/* Cores (tema escuro estilo Windows 10/11) */
+static const COLORREF C_TB_BG    = RGB(16, 16, 16);
+static const COLORREF C_TB_LINE  = RGB(45, 45, 45);
+static const COLORREF C_TB_HOVER = RGB(36, 36, 36);
+static const COLORREF C_TB_PRESS = RGB(48, 48, 48);
+
+static const COLORREF C_BG       = RGB(31, 31, 31);
+static const COLORREF C_RAIL     = RGB(23, 23, 23);
+static const COLORREF C_RAIL_HV  = RGB(42, 42, 42);
+static const COLORREF C_TILE     = RGB(45, 45, 45);
+static const COLORREF C_TILEHV   = RGB(70, 70, 70);
+static const COLORREF C_TEXT     = RGB(240, 240, 240);
+static const COLORREF C_MUTED    = RGB(150, 150, 150);
+static const COLORREF C_ACCENT   = RGB(0, 120, 215);
+static const COLORREF C_ACCENT_L = RGB(60, 160, 255);
+static const COLORREF C_LINE     = RGB(55, 55, 55);
+
+/* Estrutura de aplicativo (tile) */
+typedef struct {
+    const wchar_t *name;
+    const wchar_t *cmd;
+    const wchar_t *args;
+} APP;
+
+static const APP APPS[] = {
+    { L"Prompt de comando",  L"cmd.exe",        L"" },
+    { L"Bloco de notas",     L"notepad.exe",    L"" },
+    { L"Registo",            L"regedit.exe",    L"" },
+    { L"Explorador",         CMD_EXPLORER,      FS_ESTEPC },
+    { L"Windows",            CMD_EXPLORER,      FS_WINDOWS },
+    { L"System32",           CMD_EXPLORER,      FS_SYSTEM32 },
+    { L"Drivers",            CMD_EXPLORER,      FS_DRIVERS },
+    { L"Ger. de Tarefas",    L"taskmgr.exe",    L"" },
+    { L"Este PC",            L"explorer.exe",   L"/root,{20D04FE0-3AEA-1069-A2D8-08002B30309D}" },
+    { L"Rede",               L"control.exe",    L"ncpa.cpl" },
+    { L"Linhas de Comando",  L"cmd.exe",        L"/c start" },
+    { L"Calculadora",        L"calc.exe",       L"" },
+    { L"Paint",              L"mspaint.exe",    L"" },
+    { L"Wordpad",            L"write.exe",      L"" },
+    { L"Configurações",      L"ms-settings:",   L"" },
+    { L"Painel de Controle", L"control.exe",    L"" },
+    { L"Visualizador",       L"control.exe",    L"desk.cpl" },
+    { L"Propriedades",       L"control.exe",    L"sysdm.cpl" },
+    { L"Teclado Virtual",    L"osk.exe",        L"" },
+};
+#define N_APPS (sizeof(APPS) / sizeof(APPS[0]))
+
+/* Links de pastas na barra lateral */
+typedef struct {
+    const wchar_t *label;
+    const wchar_t *cmd;
+    const wchar_t *args;
+} FOLDER;
+
+static const FOLDER FOLDERS[] = {
+    { L"Este Computador",    CMD_EXPLORER,      FS_ESTEPC },
+    { L"Windows",            CMD_EXPLORER,      FS_WINDOWS },
+    { L"System32",           CMD_EXPLORER,      FS_SYSTEM32 },
+    { L"Drivers",            CMD_EXPLORER,      FS_DRIVERS },
+    { L"Documentos",         CMD_EXPLORER,      FS_DOCS },
+    { L"Ambiente de Trab.",  CMD_EXPLORER,      FS_DESKTOP },
+    { L"Imagens",            CMD_EXPLORER,      FS_IMGENS },
+    { L"Downloads",          L"explorer.exe",    L"{374DE290-123F-4565-9164-39C4925E467B}" },
+    { L"Musica",             L"explorer.exe",    L"{0BD0BDFE-70A1-4B9C-B200-F1EE4B9EDAC4}" },
+    { L"Videos",             L"explorer.exe",    L"{0B71B71C-8CB2-44DF-9F3F-F6ED0F8FFBEF}" },
+    { L"Configuracoes",      L"ms-settings:",    L"" },
+    { L"Painel de Controle", L"control.exe",     L"" },
+};
+#define N_FOLDERS (sizeof(FOLDERS) / sizeof(FOLDERS[0]))
+
+/* Atalhos rapidos fixados na barra de tarefas */
+typedef struct {
+    const wchar_t *name;
+    const wchar_t *cmd;
+    const wchar_t *args;
+} QUICKAPP;
+
+static const QUICKAPP QUICKAPPS[] = {
+    { L"CMD",      L"cmd.exe",     L"" },
+    { L"Arquivos", CMD_EXPLORER,   FS_ESTEPC },
+    { L"Tarefas",  L"taskmgr.exe", L"" },
+};
+#define N_QUICKAPPS (sizeof(QUICKAPPS) / sizeof(QUICKAPPS[0]))
+
+/* Variaveis de estado global */
+static HWND g_hwndTaskbar = NULL;
+static HWND g_hwndMenu = NULL;
+static HHOOK g_hMouseHook = NULL;
+static HHOOK g_hKbdHook = NULL;
+static HBRUSH g_bgBrush = NULL;
+
+static BOOL s_menuVisible = FALSE;
+static BOOL s_startBtnHover = FALSE;
+static BOOL s_startBtnPressed = FALSE;
+static BOOL s_ignoreNextStartClick = FALSE;
+static int s_quickHover = -1;
+
+static int s_tileHover = -1;
+static int s_tileScroll = 0;
+static int s_railHover = -1;
+static WCHAR s_user[128] = {0};
+static WCHAR s_query[128] = {0};
+static WNDPROC s_oldEditProc = NULL;
+
+/* Declaracoes */
+static void ToggleStartMenu(BOOL show);
+static void RebuildTiles(HWND hwnd);
+static void LayoutTiles(HWND hwnd);
+static void OpenFileExplorer(const wchar_t *startPath);
+static LRESULT CALLBACK ExpWndProc(HWND, UINT, WPARAM, LPARAM);
+
+static void GetUserNameStr(WCHAR *buf, int cch) {
+    DWORD n = (DWORD)cch;
+    if (!GetUserNameW(buf, &n)) {
+        lstrcpyW(buf, L"Administrador");
+    }
+}
+
+/* ---------- Execucao de comandos ---------- */
+
+/* Converte um argumento do explorador num caminho real.
+   "shell:<local>", um caminho ja existente, ou NULL (= Este Computador). */
+static BOOL ExpResolveStart(const wchar_t *arg, WCHAR *out, int cch) {
+    out[0] = 0;
+    if (!arg || !arg[0]) return FALSE;
+
+    if (!_wcsnicmp(arg, L"shell:", 6)) {
+        const WCHAR *k = arg + 6;
+        WCHAR winDir[MAX_PATH];
+
+        if (!lstrcmpiW(k, L"EstePC")) return FALSE;
+
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+
+        if (!lstrcmpiW(k, L"Windows"))
+            { lstrcpynW(out, winDir, cch); return out[0] != 0; }
+        if (!lstrcmpiW(k, L"System32"))
+            { wsprintfW(out, L"%s\\System32", winDir); return out[0] != 0; }
+        if (!lstrcmpiW(k, L"Drivers"))
+            { wsprintfW(out, L"%s\\System32\\Drivers", winDir); return out[0] != 0; }
+        if (!lstrcmpiW(k, L"Inf"))
+            { wsprintfW(out, L"%s\\Inf", winDir); return out[0] != 0; }
+        if (!lstrcmpiW(k, L"ProgramData"))
+            { wsprintfW(out, L"%s\\ProgramData", winDir); return out[0] != 0; }
+        if (!lstrcmpiW(k, L"ProgramFiles"))
+            { ExpandEnvironmentStringsW(L"%ProgramFiles%", out, cch); return out[0] != 0; }
+
+        UINT csidls[] = { CSIDL_DESKTOP, CSIDL_PERSONAL, CSIDL_MYPICTURES,
+                          CSIDL_PROFILE, 32 /* Downloads CSIDL_PROFILE sub */ };
+        const WCHAR *ks[] = { L"Desktop", L"Documentos", L"Imagens", L"Perfil", L"Downloads" };
+        for (int i = 0; i < 5; i++) {
+            if (!lstrcmpiW(k, ks[i])) {
+                if (i == 4)
+                    return SHGetFolderPathW(NULL, 0x000c /* CSIDL_DOWNLOADS */, NULL, 0, out) == S_OK && out[0] != 0;
+                return SHGetFolderPathW(NULL, csidls[i], NULL, 0, out) == S_OK && out[0] != 0;
+            }
+        }
+        return FALSE;
+    }
+
+    if (ExpPathExists(arg)) { lstrcpynW(out, arg, cch); return TRUE; }
+    return FALSE;
+}
+
+static void Launch(const wchar_t *cmd, const wchar_t *args) {
+    /* Explorador de arquivos integrado (janela do proprio programa) */
+    if (cmd && wcscmp(cmd, CMD_EXPLORER) == 0) {
+        WCHAR start[MAX_PATH] = {0};
+        if (ExpResolveStart(args, start, MAX_PATH)) OpenFileExplorer(start);
+        else OpenFileExplorer(NULL);
+        ToggleStartMenu(FALSE);
+        return;
+    }
+    ShellExecuteW(NULL, L"open", cmd, (args && args[0]) ? args : NULL, NULL, SW_SHOWNORMAL);
+    ToggleStartMenu(FALSE);
+}
+
+static void DoPower(int id) {
+    if (id == ID_POWEROFF) {
+        ShellExecuteW(NULL, L"open", L"wpeutil.exe", L"shutdown", NULL, SW_HIDE);
+        ExitWindowsEx(EWX_POWEROFF | EWX_FORCE, 0);
+    } else if (id == ID_REBOOT) {
+        ShellExecuteW(NULL, L"open", L"wpeutil.exe", L"reboot", NULL, SW_HIDE);
+        ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+    }
+}
+
+/* ---------- Hook do mouse para fechar o menu ao clicar fora ---------- */
+static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_menuVisible) {
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_NCLBUTTONDOWN) {
+            MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
+            POINT pt = ms->pt;
+            RECT rcMenu, rcTb, rcBtn;
+            GetWindowRect(g_hwndMenu, &rcMenu);
+            GetWindowRect(g_hwndTaskbar, &rcTb);
+            rcBtn.left = rcTb.left;
+            rcBtn.top = rcTb.top;
+            rcBtn.right = rcTb.left + START_BTN_W;
+            rcBtn.bottom = rcTb.bottom;
+
+            if (!PtInRect(&rcMenu, pt)) {
+                if (PtInRect(&rcBtn, pt)) {
+                    s_ignoreNextStartClick = TRUE;
+                }
+                ToggleStartMenu(FALSE);
+            }
+        }
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+}
+
+/* ---------- Hook do teclado de nivel baixo ----------
+   No WinPE, RegisterHotKey falha para Ctrl+Esc (reservado pelo sistema) e
+   para a tecla Win sozinha (vk=0 invalido). Este hook captura esses dois
+   atalhos diretamente. Win+E continua via RegisterHotKey (funciona). */
+static BOOL g_kCtrlDown = FALSE;
+static BOOL g_kWinDown = FALSE;
+static BOOL g_kWinChord = FALSE;   /* outra tecla pressionada junto com Win */
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
+        DWORD vk = kb->vkCode;
+        BOOL down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        BOOL up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+
+        if (vk == VK_CONTROL) {
+            g_kCtrlDown = down;
+        } else if (vk == VK_LWIN || vk == VK_RWIN) {
+            if (down) {
+                if (!g_kWinDown) { g_kWinDown = TRUE; g_kWinChord = FALSE; }
+            } else if (g_kWinDown) {
+                g_kWinDown = FALSE;
+                if (!g_kWinChord) {
+                    /* Win solta sem outra tecla -> Menu Iniciar */
+                    ToggleStartMenu(!s_menuVisible);
+                    DbgSet("WIN-toggle");
+                }
+            }
+        } else if (down && g_kWinDown) {
+            g_kWinChord = TRUE;    /* ex.: Win+E nao abre o menu ao soltar */
+        }
+
+        /* Ctrl+Esc -> abre/fecha o Menu Iniciar (e engola o Esc das janelas) */
+        if (down && vk == VK_ESCAPE && g_kCtrlDown) {
+            ToggleStartMenu(!s_menuVisible);
+            DbgSet("CTRLESC");
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_hKbdHook, nCode, wParam, lParam);
+}
+
+/* ---------- Alternar visibilidade do Menu Iniciar ---------- */
+static void ToggleStartMenu(BOOL show) {
+    if (show == s_menuVisible) return;
+    s_menuVisible = show;
+
+    if (s_menuVisible) {
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int menuW = (WIN_W > screenW - 20) ? (screenW - 20) : WIN_W;
+        int menuH = (WIN_H > screenH - TASKBAR_H - 10) ? (screenH - TASKBAR_H - 10) : WIN_H;
+        int menuX = 0;
+        int menuY = screenH - TASKBAR_H - menuH;
+
+        SetWindowPos(g_hwndMenu, HWND_TOPMOST, menuX, menuY, menuW, menuH, SWP_NOACTIVATE);
+
+        /* Animacao de subida (slide up) acima da barra de tarefas */
+        if (!AnimateWindow(g_hwndMenu, 150, AW_SLIDE | AW_VER_NEGATIVE | AW_ACTIVATE)) {
+            ShowWindow(g_hwndMenu, SW_SHOW);
+            SetWindowPos(g_hwndMenu, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        SetForegroundWindow(g_hwndMenu);
+        SetFocus(GetDlgItem(g_hwndMenu, ID_SEARCH));
+
+        if (!g_hMouseHook) {
+            g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(NULL), 0);
+        }
+    } else {
+        if (g_hMouseHook) {
+            UnhookWindowsHookEx(g_hMouseHook);
+            g_hMouseHook = NULL;
+        }
+        /* Animacao de descida (slide down) */
+        if (!AnimateWindow(g_hwndMenu, 100, AW_SLIDE | AW_VER_POSITIVE | AW_HIDE)) {
+            ShowWindow(g_hwndMenu, SW_HIDE);
+        }
+        /* Limpa a caixa de pesquisa */
+        s_query[0] = 0;
+        SetDlgItemTextW(g_hwndMenu, ID_SEARCH, L"");
+        RebuildTiles(g_hwndMenu);
+    }
+
+    if (g_hwndTaskbar) {
+        InvalidateRect(g_hwndTaskbar, NULL, FALSE);
+    }
+}
+
+/* ---------- Desenho de um tile (app) ---------- */
+static void DrawTile(HDC dc, const APP *a, int x, int y, int w, int h, BOOL hot) {
+    RECT tileRect = { x, y, x + w, y + h };
+    FillRect(dc, &tileRect, g_bgBrush);
+
+    HBRUSH bg = CreateSolidBrush(hot ? C_TILEHV : C_TILE);
+    HPEN pen = CreatePen(PS_SOLID, 1, hot ? RGB(95, 95, 95) : C_LINE);
+    HBRUSH oldB = (HBRUSH)SelectObject(dc, bg);
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    RoundRect(dc, x, y, x + w, y + h, 8, 8);
+    SelectObject(dc, oldB); SelectObject(dc, oldP);
+    DeleteObject(bg); DeleteObject(pen);
+
+    /* Avatar: circulo com a primeira letra */
+    int cx = x + w / 2, cy = y + 36, r = 20;
+    HBRUSH av = CreateSolidBrush(C_ACCENT);
+    HPEN ap = CreatePen(PS_SOLID, 1, C_ACCENT);
+    HBRUSH oldB2 = (HBRUSH)SelectObject(dc, av);
+    HPEN oldP2 = (HPEN)SelectObject(dc, ap);
+    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+    SelectObject(dc, oldB2); SelectObject(dc, oldP2);
+    DeleteObject(av); DeleteObject(ap);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_TEXT);
+    HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldF = (HFONT)SelectObject(dc, f);
+    WCHAR letter[2] = { a->name[0], 0 };
+    SIZE sz;
+    GetTextExtentPoint32W(dc, letter, 1, &sz);
+    TextOutW(dc, cx - sz.cx / 2, cy - sz.cy / 2 - 1, letter, 1);
+
+    GetTextExtentPoint32W(dc, a->name, (int)wcslen(a->name), &sz);
+    TextOutW(dc, cx - sz.cx / 2, y + 64, a->name, (int)wcslen(a->name));
+    SelectObject(dc, oldF);
+}
+
+/* ---------- Desenho de um link de pasta/usuario ---------- */
+static void DrawLink(HDC dc, const wchar_t *text, int x, int y, int w, int h, BOOL hot) {
+    if (hot) {
+        RECT r = { x + 6, y, x + w - 6, y + h };
+        HBRUSH br = CreateSolidBrush(C_RAIL_HV);
+        FillRect(dc, &r, br);
+        DeleteObject(br);
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, hot ? RGB(255, 255, 255) : C_TEXT);
+    HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldF = (HFONT)SelectObject(dc, f);
+    TextOutW(dc, x + 16, y + (h - 15) / 2, text, (int)wcslen(text));
+    SelectObject(dc, oldF);
+}
+
+/* ---------- Icones vetoriais GDI para Desligar / Reiniciar ---------- */
+static void DrawIconPower(HDC dc, int cx, int cy, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 2, color);
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    HBRUSH oldB = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Arc(dc, cx - 7, cy - 7, cx + 7, cy + 7, cx + 5, cy - 5, cx - 5, cy - 5);
+    MoveToEx(dc, cx, cy - 10, NULL);
+    LineTo(dc, cx, cy - 1);
+    SelectObject(dc, oldB);
+    SelectObject(dc, oldP);
+    DeleteObject(pen);
+}
+
+static void DrawIconRestart(HDC dc, int cx, int cy, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 2, color);
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    HBRUSH oldB = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Arc(dc, cx - 7, cy - 7, cx + 7, cy + 7, cx + 7, cy, cx, cy - 7);
+    POINT tri[3];
+    tri[0].x = cx - 3; tri[0].y = cy - 12;
+    tri[1].x = cx + 5; tri[1].y = cy - 8;
+    tri[2].x = cx - 2; tri[2].y = cy - 4;
+    HBRUSH br = CreateSolidBrush(color);
+    HBRUSH prev = (HBRUSH)SelectObject(dc, br);
+    Polygon(dc, tri, 3);
+    SelectObject(dc, prev);
+    DeleteObject(br);
+    SelectObject(dc, oldB);
+    SelectObject(dc, oldP);
+    DeleteObject(pen);
+}
+
+/* ---------- Botoes de alimentacao ---------- */
+static void DrawPowerBtn(HDC dc, const wchar_t *text, int x, int y, int w, int h, BOOL hot, BOOL power) {
+    HBRUSH bg = CreateSolidBrush(hot ? RGB(58, 58, 58) : RGB(36, 36, 36));
+    HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
+    HBRUSH oldB = (HBRUSH)SelectObject(dc, bg);
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    RoundRect(dc, x, y, x + w, y + h, 6, 6);
+    SelectObject(dc, oldB); SelectObject(dc, oldP);
+    DeleteObject(bg); DeleteObject(pen);
+
+    COLORREF ic = hot ? RGB(255, 255, 255) : C_TEXT;
+    if (power) DrawIconPower(dc, x + 18, y + h / 2, ic);
+    else       DrawIconRestart(dc, x + 18, y + h / 2, ic);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_TEXT);
+    HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldF = (HFONT)SelectObject(dc, f);
+    TextOutW(dc, x + 34, y + (h - 15) / 2, text, (int)wcslen(text));
+    SelectObject(dc, oldF);
+}
+
+/* ---------- Botao de fechar (X) ---------- */
+static void DrawCloseBtn(HDC dc, int x, int y, int w, int h, BOOL hot) {
+    RECT r = { x, y, x + w, y + h };
+    if (hot) {
+        HBRUSH br = CreateSolidBrush(RGB(196, 43, 28));
+        FillRect(dc, &r, br);
+        DeleteObject(br);
+    } else {
+        FillRect(dc, &r, g_bgBrush);
+    }
+
+    COLORREF c = hot ? RGB(255, 255, 255) : RGB(180, 180, 180);
+    HPEN pen = CreatePen(PS_SOLID, 2, c);
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    int m = 8;
+    MoveToEx(dc, x + m, y + m, NULL);
+    LineTo(dc, x + w - m, y + h - m);
+    MoveToEx(dc, x + w - m, y + m, NULL);
+    LineTo(dc, x + m, y + h - m);
+    SelectObject(dc, oldP);
+    DeleteObject(pen);
+}
+
+/* ---------- Filtro e criacao dos tiles ---------- */
+static BOOL AppMatches(const APP *a) {
+    if (!s_query[0]) return TRUE;
+    WCHAR tmp[128], q[128];
+    lstrcpynW(tmp, a->name, 128);
+    CharLowerW(tmp);
+    lstrcpynW(q, s_query, 128);
+    CharLowerW(q);
+    return wcsstr(tmp, q) != NULL;
+}
+
+static void RebuildTiles(HWND hwnd) {
+    for (int i = 0; i < (int)N_APPS; i++) {
+        HWND h = GetDlgItem(hwnd, TILE_BASE + i);
+        if (h) DestroyWindow(h);
+    }
+    int tx = RAIL_W + 20;
+    int ty = HEADER_H + 20;
+    int visible = 0;
+    int viewBottom = WIN_H - 10;
+    for (int i = 0; i < (int)N_APPS; i++) {
+        if (!AppMatches(&APPS[i])) continue;
+        int vx = tx + (visible % TILES_ROW) * (TILE_W + TILE_GAP);
+        int vy = ty + (visible / TILES_ROW) * (TILE_H + TILE_GAP);
+        BOOL show = (vy + TILE_H >= ty && vy <= viewBottom);
+        HWND ht = CreateWindowW(L"BUTTON", L"",
+            WS_CHILD | (show ? WS_VISIBLE : 0) | BS_OWNERDRAW,
+            vx, vy, TILE_W, TILE_H,
+            hwnd, (HMENU)(UINT_PTR)(TILE_BASE + visible),
+            (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), NULL);
+        SetWindowLongPtrW(ht, GWLP_USERDATA, (LONG_PTR)i);
+        visible++;
+    }
+    s_tileHover = -1;
+    s_tileScroll = 0;
+}
+
+static void LayoutTiles(HWND hwnd) {
+    int tx = RAIL_W + 20;
+    int ty = HEADER_H + 20;
+    int visible = 0;
+    int viewBottom = WIN_H - 10;
+    for (int i = 0; i < (int)N_APPS; i++) {
+        if (!AppMatches(&APPS[i])) continue;
+        HWND ht = GetDlgItem(hwnd, TILE_BASE + visible);
+        if (ht) {
+            int col = visible % TILES_ROW;
+            int row = visible / TILES_ROW;
+            int vx = tx + col * (TILE_W + TILE_GAP);
+            int vy = ty + row * (TILE_H + TILE_GAP) - s_tileScroll;
+            if (vy + TILE_H < ty || vy > viewBottom) {
+                ShowWindow(ht, SW_HIDE);
+            } else {
+                MoveWindow(ht, vx, vy, TILE_W, TILE_H, TRUE);
+                ShowWindow(ht, SW_SHOW);
+            }
+        }
+        visible++;
+    }
+}
+
+static int MaxTileScroll(void) {
+    int n = 0;
+    for (int i = 0; i < (int)N_APPS; i++) if (AppMatches(&APPS[i])) n++;
+    int rows = (n + TILES_ROW - 1) / TILES_ROW;
+    int content = rows * (TILE_H + TILE_GAP);
+    int view = WIN_H - (HEADER_H + 20) - 10;
+    int max = content - view;
+    return max > 0 ? max : 0;
+}
+
+/* Subclasse do Edit de pesquisa: Enter executa o primeiro resultado, Esc fecha */
+static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) {
+            for (int i = 0; i < (int)N_APPS; i++) {
+                if (AppMatches(&APPS[i])) {
+                    Launch(APPS[i].cmd, APPS[i].args);
+                    break;
+                }
+            }
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            ToggleStartMenu(FALSE);
+            return 0;
+        }
+    }
+    return CallWindowProcW(s_oldEditProc, hwnd, msg, wParam, lParam);
+}
+
+/* ---------- WndProc do Menu Iniciar (janela popup) ---------- */
+static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        /* Caixa de pesquisa */
+        HWND hSearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            RAIL_W + 20, 14, WIN_W - RAIL_W - 76, 28,
+            hwnd, (HMENU)(UINT_PTR)ID_SEARCH, (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), NULL);
+
+        if (hSearch) {
+            s_oldEditProc = (WNDPROC)SetWindowLongPtrW(hSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
+        }
+
+        /* Botao fechar (X) */
+        CreateWindowW(L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            WIN_W - 38, 14, 28, 28,
+            hwnd, (HMENU)(UINT_PTR)ID_CLOSE,
+            (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), NULL);
+
+        /* Grade de tiles */
+        RebuildTiles(hwnd);
+
+        /* Botoes de alimentacao */
+CreateWindowW(L"BUTTON", L"Desligar",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            16, POWER_TOP + 14, RAIL_W - 32, 30,
+            hwnd, (HMENU)(UINT_PTR)ID_POWEROFF,
+            (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), NULL);
+
+        CreateWindowW(L"BUTTON", L"Reiniciar",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            16, POWER_TOP + 48, RAIL_W - 32, 30,
+            hwnd, (HMENU)(UINT_PTR)ID_REBOOT,
+            (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), NULL);
+
+        GetUserNameStr(s_user, 128);
+        SetTimer(hwnd, IDT_HOVER, 50, NULL);
+        break;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        /* Fundo principal */
+        HBRUSH bg = CreateSolidBrush(C_BG);
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+
+        /* Barra lateral esquerda */
+        HBRUSH rail = CreateSolidBrush(C_RAIL);
+        RECT rRail = { 0, 0, RAIL_W, WIN_H };
+        FillRect(dc, &rRail, rail);
+        DeleteObject(rail);
+
+        /* Borda externa do menu */
+        HPEN borderPen = CreatePen(PS_SOLID, 1, C_LINE);
+        HPEN oldP = (HPEN)SelectObject(dc, borderPen);
+        HBRUSH oldB = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, 0, 0, rc.right, rc.bottom);
+        SelectObject(dc, oldB);
+
+        /* Linha separadora vertical entre trilho e tiles */
+        MoveToEx(dc, RAIL_W, 0, NULL);
+        LineTo(dc, RAIL_W, WIN_H);
+        SelectObject(dc, oldP);
+        DeleteObject(borderPen);
+
+        /* Titulo do Menu */
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, C_TEXT);
+        HFONT fTitle = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT oldF = (HFONT)SelectObject(dc, fTitle);
+        TextOutW(dc, 18, 18, L"Menu Iniciar", (int)wcslen(L"Menu Iniciar"));
+
+        /* Contador de resultados da pesquisa */
+        SetTextColor(dc, C_MUTED);
+        WCHAR sub[64];
+        int nmatch = 0;
+        for (int i = 0; i < (int)N_APPS; i++) if (AppMatches(&APPS[i])) nmatch++;
+        if (s_query[0])
+            wsprintfW(sub, L"Resultados para a pesquisa (%d)", nmatch);
+        else
+            wsprintfW(sub, L"Todos os aplicativos (%d)", nmatch);
+        TextOutW(dc, RAIL_W + 20, 50, sub, (int)wcslen(sub));
+
+        /* Usuario na barra lateral */
+        SetTextColor(dc, C_TEXT);
+        TextOutW(dc, 16, HEADER_H + 10, s_user, (int)wcslen(s_user));
+
+        /* Rotulo da lista de locais */
+        SetTextColor(dc, C_MUTED);
+        TextOutW(dc, 16, HEADER_H + 30, L"LOCAIS", 6);
+
+        /* Links de pastas com hover */
+        int fy = RAIL_TOP;
+        for (int i = 0; i < (int)N_FOLDERS; i++) {
+            if (fy + RAIL_ITEM_H > POWER_TOP - 4) break;
+            DrawLink(dc, FOLDERS[i].label, 0, fy, RAIL_W, RAIL_ITEM_H, s_railHover == i);
+            fy += RAIL_ITEM_H;
+        }
+
+        /* Separador horizontal acima dos botoes de energia */
+        HPEN sep = CreatePen(PS_SOLID, 1, C_LINE);
+        HPEN oldSep = (HPEN)SelectObject(dc, sep);
+        MoveToEx(dc, 10, POWER_TOP, NULL);
+        LineTo(dc, RAIL_W - 10, POWER_TOP);
+        SelectObject(dc, oldSep);
+        DeleteObject(sep);
+
+        SelectObject(dc, oldF);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT pt;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+
+        int hover = -1;
+        if (pt.x >= 0 && pt.x < RAIL_W && pt.y >= RAIL_TOP && pt.y < POWER_TOP) {
+            hover = (pt.y - RAIL_TOP) / RAIL_ITEM_H;
+            if (hover >= (int)N_FOLDERS) hover = -1;
+        }
+        if (hover != s_railHover) {
+            s_railHover = hover;
+            RECT rRail = { 0, RAIL_TOP, RAIL_W, POWER_TOP };
+            InvalidateRect(hwnd, &rRail, FALSE);
+        }
+        break;
+    }
+    case WM_TIMER: {
+        if (wParam == IDT_HOVER) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            int tx = RAIL_W + 20, ty = HEADER_H + 20;
+            int visible = 0, hover = -1;
+            for (int i = 0; i < (int)N_APPS; i++) {
+                if (!AppMatches(&APPS[i])) continue;
+                int vx = tx + (visible % TILES_ROW) * (TILE_W + TILE_GAP);
+                int vy = ty + (visible / TILES_ROW) * (TILE_H + TILE_GAP) - s_tileScroll;
+                if (pt.x >= vx && pt.x < vx + TILE_W && pt.y >= vy && pt.y < vy + TILE_H) {
+                    hover = TILE_BASE + visible;
+                    break;
+                }
+                visible++;
+            }
+            if (hover != s_tileHover) {
+                int old = s_tileHover;
+                s_tileHover = hover;
+                if (old >= TILE_BASE) {
+                    HWND hOld = GetDlgItem(hwnd, old);
+                    if (hOld) InvalidateRect(hOld, NULL, FALSE);
+                }
+                if (s_tileHover >= TILE_BASE) {
+                    HWND hNew = GetDlgItem(hwnd, s_tileHover);
+                    if (hNew) InvalidateRect(hNew, NULL, FALSE);
+                }
+            }
+        }
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, C_TEXT);
+        SetBkColor(dc, RGB(38, 38, 38));
+        SetBkMode(dc, OPAQUE);
+        static HBRUSH editBg = NULL;
+        if (!editBg) editBg = CreateSolidBrush(RGB(38, 38, 38));
+        return (LRESULT)editBg;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lParam;
+        if (di->CtlType != ODT_BUTTON) break;
+        int id = di->CtlID;
+        HDC dc = di->hDC;
+        BOOL hot = (di->itemState & ODS_SELECTED) != 0;
+
+        /* Tiles */
+        if (id >= TILE_BASE && id < TILE_BASE + (int)N_APPS) {
+            int idx = (int)GetWindowLongPtrW(di->hwndItem, GWLP_USERDATA);
+            if (idx >= 0 && idx < (int)N_APPS) {
+                DrawTile(dc, &APPS[idx], di->rcItem.left, di->rcItem.top,
+                         di->rcItem.right - di->rcItem.left,
+                         di->rcItem.bottom - di->rcItem.top,
+                         hot || (s_tileHover == id));
+                return TRUE;
+            }
+        }
+
+        /* Botoes de energia */
+        if (id == ID_POWEROFF || id == ID_REBOOT) {
+            const wchar_t *txt = (id == ID_POWEROFF) ? L"Desligar" : L"Reiniciar";
+            DrawPowerBtn(dc, txt, di->rcItem.left, di->rcItem.top,
+                         di->rcItem.right - di->rcItem.left,
+                         di->rcItem.bottom - di->rcItem.top, hot,
+                         id == ID_POWEROFF);
+            return TRUE;
+        }
+
+        /* Botao de fechar */
+        if (id == ID_CLOSE) {
+            DrawCloseBtn(dc, di->rcItem.left, di->rcItem.top,
+                         di->rcItem.right - di->rcItem.left,
+                         di->rcItem.bottom - di->rcItem.top, hot);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        if (id == ID_CLOSE) {
+            ToggleStartMenu(FALSE);
+            return 0;
+        }
+        if (id == ID_POWEROFF || id == ID_REBOOT) {
+            DoPower(id);
+            return 0;
+        }
+        if (id == ID_SEARCH && code == EN_CHANGE) {
+            GetDlgItemTextW(hwnd, ID_SEARCH, s_query, (int)(sizeof(s_query) / sizeof(s_query[0])));
+            RebuildTiles(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        if (id >= TILE_BASE && id - TILE_BASE < N_APPS) {
+            HWND ht = GetDlgItem(hwnd, id);
+            int idx = (int)GetWindowLongPtrW(ht, GWLP_USERDATA);
+            if (idx >= 0 && idx < N_APPS) {
+                Launch(APPS[idx].cmd, APPS[idx].args);
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        POINT pt;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+
+        int fy = RAIL_TOP;
+        for (int j = 0; j < (int)N_FOLDERS; j++) {
+            if (fy + RAIL_ITEM_H > POWER_TOP - 4) break;
+            if (pt.x >= 0 && pt.x < RAIL_W && pt.y >= fy && pt.y < fy + RAIL_ITEM_H) {
+                Launch(FOLDERS[j].cmd, FOLDERS[j].args);
+                return 0;
+            }
+            fy += RAIL_ITEM_H;
+        }
+        break;
+    }
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int max = MaxTileScroll();
+        int old = s_tileScroll;
+        if (delta > 0)      s_tileScroll -= TILE_H + TILE_GAP;
+        else if (delta < 0) s_tileScroll += TILE_H + TILE_GAP;
+        if (s_tileScroll < 0) s_tileScroll = 0;
+        if (s_tileScroll > max) s_tileScroll = max;
+        if (s_tileScroll != old) {
+            LayoutTiles(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_ACTIVATE: {
+        if (LOWORD(wParam) == WA_INACTIVE && s_menuVisible) {
+            POINT pt;
+            GetCursorPos(&pt);
+            RECT rcTb, rcBtn;
+            GetWindowRect(g_hwndTaskbar, &rcTb);
+            rcBtn.left = rcTb.left;
+            rcBtn.top = rcTb.top;
+            rcBtn.right = rcTb.left + START_BTN_W;
+            rcBtn.bottom = rcTb.bottom;
+
+            if (PtInRect(&rcBtn, pt)) {
+                s_ignoreNextStartClick = TRUE;
+            }
+            DbgSet("ACT-close");
+            ToggleStartMenu(FALSE);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            ToggleStartMenu(FALSE);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        ToggleStartMenu(FALSE);
+        return 0;
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+/* ---------- WndProc da Barra de Tarefas (Shell principal) ---------- */
+static LRESULT CALLBACK TaskbarWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        SetTimer(hwnd, IDT_CLOCK, 1000, NULL);
+        break;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, IDT_CLOCK);
+        PostQuitMessage(0);
+        break;
+
+    case WM_DISPLAYCHANGE: {
+        int sw = LOWORD(lParam);
+        int sh = HIWORD(lParam);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, sh - TASKBAR_H, sw, TASKBAR_H, SWP_NOACTIVATE);
+        if (g_hwndMenu) {
+            int mw = (WIN_W > sw - 20) ? (sw - 20) : WIN_W;
+            int mh = (WIN_H > sh - TASKBAR_H - 10) ? (sh - TASKBAR_H - 10) : WIN_H;
+            SetWindowPos(g_hwndMenu, HWND_TOPMOST, 0, sh - TASKBAR_H - mh, mw, mh, SWP_NOACTIVATE);
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    }
+
+    case WM_HOTKEY:
+        if (wParam == 101) {
+            /* Win+E: Explorador de Arquivos */
+            WCHAR start[MAX_PATH] = {0};
+            if (!ExpResolveStart(FS_ESTEPC, start, MAX_PATH)) start[0] = 0;
+            OpenFileExplorer(start[0] ? start : NULL);
+            DbgSet("HK101");
+            return 0;
+        }
+        DbgSet("HK?");
+        break;
+
+    case WM_MOUSEMOVE: {
+        POINT pt;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+
+        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+
+        BOOL oldBtnHover = s_startBtnHover;
+        int oldQuickHover = s_quickHover;
+
+        s_startBtnHover = (pt.x >= 0 && pt.x < START_BTN_W && pt.y >= 0 && pt.y < TASKBAR_H);
+
+        s_quickHover = -1;
+        for (int i = 0; i < (int)N_QUICKAPPS; i++) {
+            int qx = START_BTN_W + 8 + i * (QUICK_W + 4);
+            if (pt.x >= qx && pt.x < qx + QUICK_W && pt.y >= 4 && pt.y < TASKBAR_H - 4) {
+                s_quickHover = i;
+                break;
+            }
+        }
+
+        if (oldBtnHover != s_startBtnHover || oldQuickHover != s_quickHover) {
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    }
+
+    case WM_MOUSELEAVE: {
+        if (s_startBtnHover || s_quickHover != -1) {
+            s_startBtnHover = FALSE;
+            s_quickHover = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+
+        if (pt.x >= 0 && pt.x < START_BTN_W) {
+            s_startBtnPressed = TRUE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            if (s_menuVisible) {
+                ToggleStartMenu(FALSE);
+            }
+            for (int i = 0; i < (int)N_QUICKAPPS; i++) {
+                int qx = START_BTN_W + 8 + i * (QUICK_W + 4);
+                if (pt.x >= qx && pt.x < qx + QUICK_W && pt.y >= 4 && pt.y < TASKBAR_H - 4) {
+                    Launch(QUICKAPPS[i].cmd, QUICKAPPS[i].args);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    case WM_LBUTTONUP: {
+        POINT pt;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+
+        if (s_startBtnPressed) {
+            s_startBtnPressed = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+
+            if (pt.x >= 0 && pt.x < START_BTN_W && pt.y >= 0 && pt.y < TASKBAR_H) {
+                if (s_ignoreNextStartClick) {
+                    s_ignoreNextStartClick = FALSE;
+                    DbgSet("IGN");
+                } else {
+                    ToggleStartMenu(!s_menuVisible);
+                    {
+                        char b[64];
+                        wsprintfA(b, "CLK v=%d w=%d", s_menuVisible,
+                                  (g_hwndMenu && IsWindowVisible(g_hwndMenu)) ? 1 : 0);
+                        DbgSet(b);
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    case WM_TIMER: {
+        if (wParam == IDT_CLOCK) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            RECT rcClock = { rc.right - 95, 0, rc.right, rc.bottom };
+            InvalidateRect(hwnd, &rcClock, FALSE);
+        }
+        break;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HBITMAP oldBM = (HBITMAP)SelectObject(memDC, memBM);
+
+        /* Fundo da barra */
+        HBRUSH bg = CreateSolidBrush(C_TB_BG);
+        FillRect(memDC, &rc, bg);
+        DeleteObject(bg);
+
+        /* Borda superior sutil */
+        HPEN linePen = CreatePen(PS_SOLID, 1, C_TB_LINE);
+        HPEN oldPen = (HPEN)SelectObject(memDC, linePen);
+        MoveToEx(memDC, 0, 0, NULL);
+        LineTo(memDC, rc.right, 0);
+        SelectObject(memDC, oldPen);
+        DeleteObject(linePen);
+
+        /* Desenho do Botao Iniciar */
+        RECT rcBtn = { 0, 0, START_BTN_W, rc.bottom };
+        if (s_menuVisible || s_startBtnPressed) {
+            HBRUSH btnBg = CreateSolidBrush(C_TB_PRESS);
+            FillRect(memDC, &rcBtn, btnBg);
+            DeleteObject(btnBg);
+        } else if (s_startBtnHover) {
+            HBRUSH btnBg = CreateSolidBrush(C_TB_HOVER);
+            FillRect(memDC, &rcBtn, btnBg);
+            DeleteObject(btnBg);
+        }
+
+        /* Logotipo Windows 10/11 (4 quadrantes) */
+        int cx = START_BTN_W / 2;
+        int cy = rc.bottom / 2;
+        COLORREF logoColor = (s_menuVisible || s_startBtnPressed || s_startBtnHover)
+                             ? RGB(255, 255, 255) : C_ACCENT;
+        HBRUSH logoBr = CreateSolidBrush(logoColor);
+
+        RECT r1 = { cx - 8, cy - 8, cx - 1, cy - 1 };
+        RECT r2 = { cx + 1, cy - 8, cx + 8, cy - 1 };
+        RECT r3 = { cx - 8, cy + 1, cx - 1, cy + 8 };
+        RECT r4 = { cx + 1, cy + 1, cx + 8, cy + 8 };
+        FillRect(memDC, &r1, logoBr);
+        FillRect(memDC, &r2, logoBr);
+        FillRect(memDC, &r3, logoBr);
+        FillRect(memDC, &r4, logoBr);
+        DeleteObject(logoBr);
+
+        /* Indicador acentuado na base quando o menu esta aberto */
+        if (s_menuVisible) {
+            RECT rcAcc = { 0, rc.bottom - 2, START_BTN_W, rc.bottom };
+            HBRUSH accBr = CreateSolidBrush(C_ACCENT);
+            FillRect(memDC, &rcAcc, accBr);
+            DeleteObject(accBr);
+        }
+
+        /* Atalhos rapidos na barra de tarefas */
+        for (int i = 0; i < (int)N_QUICKAPPS; i++) {
+            int qx = START_BTN_W + 8 + i * (QUICK_W + 4);
+            int qy = 4;
+            RECT rq = { qx, qy, qx + QUICK_W, rc.bottom - 4 };
+            if (s_quickHover == i) {
+                HBRUSH qbr = CreateSolidBrush(C_TB_PRESS);
+                FillRect(memDC, &rq, qbr);
+                DeleteObject(qbr);
+            }
+            int bx = qx + 6, by = qy + 4, bw = QUICK_W - 12, bh = rc.bottom - 16;
+            if (i == 0) {
+                /* CMD: terminal preto com prompt verde */
+                RECT rCmd = { bx, by, bx + bw, by + bh };
+                HBRUSH brCmd = CreateSolidBrush(RGB(0, 0, 0));
+                FillRect(memDC, &rCmd, brCmd);
+                DeleteObject(brCmd);
+                HPEN pCmd = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
+                HPEN oldPC = (HPEN)SelectObject(memDC, pCmd);
+                HBRUSH oldBC = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
+                Rectangle(memDC, bx, by, bx + bw, by + bh);
+                SelectObject(memDC, oldBC);
+                SelectObject(memDC, oldPC);
+                DeleteObject(pCmd);
+
+                SetBkMode(memDC, TRANSPARENT);
+                SetTextColor(memDC, RGB(0, 255, 128));
+                HFONT fC = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+                HFONT oldF = (HFONT)SelectObject(memDC, fC);
+                RECT rcTxt = { rCmd.left, rCmd.top, rCmd.right, rCmd.bottom };
+                DrawTextW(memDC, L">_", 2, &rcTxt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(memDC, oldF);
+            } else {
+                /* Explorador de arquivos: pasta amarela */
+                int ix = bx + (bw - 18) / 2;
+                int iy = by + (bh - 14) / 2;
+                RECT rTab = { ix, iy + 1, ix + 8, iy + 4 };
+                HBRUSH brTab = CreateSolidBrush(RGB(214, 148, 0));
+                FillRect(memDC, &rTab, brTab);
+                DeleteObject(brTab);
+                RECT rBody = { ix, iy + 3, ix + 18, iy + 14 };
+                HBRUSH brBody = CreateSolidBrush(RGB(255, 199, 44));
+                FillRect(memDC, &rBody, brBody);
+                DeleteObject(brBody);
+
+                HFONT fE = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                HFONT oldF = (HFONT)SelectObject(memDC, fE);
+                SelectObject(memDC, oldF);
+            }
+        }
+
+        /* Relogio e Data no canto direito */
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        WCHAR szTime[16], szDate[16];
+        wsprintfW(szTime, L"%02d:%02d", st.wHour, st.wMinute);
+        wsprintfW(szDate, L"%02d/%02d/%04d", st.wDay, st.wMonth, st.wYear);
+
+        SetBkMode(memDC, TRANSPARENT);
+        HFONT fSys = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT oldF = (HFONT)SelectObject(memDC, fSys);
+
+        RECT rcTime = { rc.right - 90, 4, rc.right - 10, 20 };
+        RECT rcDate = { rc.right - 90, 20, rc.right - 10, 36 };
+
+        SetTextColor(memDC, C_TEXT);
+        DrawTextW(memDC, szTime, -1, &rcTime, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+        SetTextColor(memDC, C_MUTED);
+        DrawTextW(memDC, szDate, -1, &rcDate, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+        SelectObject(memDC, oldF);
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+        break;
+    }
+
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    return 0;
+}/* =========================================================================
+   Explorador de arquivos integrado
+   Janela independente ao estilo do Explorer classico: barra de navegacao,
+   painel de locais, lista de itens e barra de estado.
+   ========================================================================= */
+
+static int g_expCascade = 0;   /* deslocamento em cascata das janelas */
+
+/* ---------- extensao de um nome ---------- */
+static const WCHAR *ExpExtFor(const WCHAR *name) {
+    const WCHAR *dot = wcsrchr(name, L'.');
+    if (dot && dot != name) return dot + 1;
+    return NULL;
+}
+
+/* ---------- Icones vetoriais desenhados com GDI ---------- */
+static void DrawExpIcon(HDC dc, int x, int y, int sz, BOOL isDir, BOOL isDrive,
+                        const WCHAR *ext) {
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HPEN oldP = (HPEN)SelectObject(dc, pen);
+    HBRUSH oldBr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    if (isDir) {
+        /* Pasta: aba + corpo + topo claro */
+        int w = sz - 2, h = sz - 5;
+        int tabW = (int)(w * 0.45);
+        HBRUSH brTab = CreateSolidBrush(RGB(214, 148, 0));
+        HBRUSH brBody = CreateSolidBrush(RGB(255, 199, 44));
+        HBRUSH brTop = CreateSolidBrush(RGB(255, 224, 130));
+
+        RECT rcTab = { x, y + 2, x + tabW, y + 7 };
+        FillRect(dc, &rcTab, brTab);
+        Rectangle(dc, x, y + 2, x + tabW, y + 7);
+
+        RECT rcBody = { x, y + 6, x + w, y + 2 + h };
+        FillRect(dc, &rcBody, brBody);
+        Rectangle(dc, x, y + 6, x + w, y + 2 + h);
+
+        RECT rcTop = { x + 2, y + 8, x + w - 2, y + 11 };
+        FillRect(dc, &rcTop, brTop);
+
+        DeleteObject(brTab); DeleteObject(brBody); DeleteObject(brTop);
+    } else if (isDrive) {
+        /* Disco: rectangulo arredondado + anel central */
+        HBRUSH br = CreateSolidBrush(E_DRIVE);
+        SelectObject(dc, br);
+        RoundRect(dc, x, y + 3, x + sz - 3, y + sz - 3, 4, 4);
+        DeleteObject(br);
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, x + sz / 2 - 4, y + sz / 2 - 4, x + sz / 2 + 4, y + sz / 2 + 4);
+        MoveToEx(dc, x + sz / 2, y + sz / 2 - 4, NULL);
+        LineTo(dc, x + sz / 2, y + sz / 2 - 1);
+    } else {
+        /* Ficheiro: folha com canto dobrado + emblema da extensao */
+        int fw = sz - 8, fh = sz - 3;
+        int fx = x + 2, fy = y;
+        HBRUSH brPage = CreateSolidBrush(RGB(255, 255, 255));
+        SelectObject(dc, brPage);
+        Rectangle(dc, fx, fy, fx + fw, fy + fh);
+        DeleteObject(brPage);
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+        /* canto dobrado (triangulo no canto superior direito) */
+        HBRUSH brFold = CreateSolidBrush(RGB(200, 200, 200));
+        SelectObject(dc, brFold);
+        POINT tri[3];
+        tri[0].x = fx + fw - 5; tri[0].y = fy;
+        tri[1].x = fx + fw;       tri[1].y = fy + 5;
+        tri[2].x = fx + fw;       tri[2].y = fy;
+        Polygon(dc, tri, 3);
+        DeleteObject(brFold);
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+        /* emblema com a extensao */
+        if (ext && ext[0]) {
+            WCHAR badge[8] = {0};
+            int n = 0;
+            while (ext[n] && n < 4) {
+                badge[n] = (WCHAR)(ext[n] >= L'a' ? ext[n] - 32 : ext[n]);
+                n++;
+            }
+            badge[n] = 0;
+
+            COLORREF bc = RGB(96, 120, 160);
+            if (!_wcsicmp(badge, L"EXE") || !_wcsicmp(badge, L"COM")) bc = RGB(0, 120, 215);
+            else if (!_wcsicmp(badge, L"CMD") || !_wcsicmp(badge, L"BAT") || !_wcsicmp(badge, L"PS1")) bc = RGB(30, 30, 30);
+            else if (!_wcsicmp(badge, L"INI") || !_wcsicmp(badge, L"INF") || !_wcsicmp(badge, L"LOG") || !_wcsicmp(badge, L"TXT")) bc = RGB(90, 90, 90);
+            else if (!_wcsicmp(badge, L"WIM") || !_wcsicmp(badge, L"CAB") || !_wcsicmp(badge, L"ZIP")) bc = RGB(190, 140, 40);
+            else if (!_wcsicmp(badge, L"SYS") || !_wcsicmp(badge, L"DLL")) bc = RGB(120, 70, 70);
+
+            HBRUSH brb = CreateSolidBrush(bc);
+            RECT rcBadge = { fx + 2, fy + fh - 8, fx + fw - 1, fy + fh };
+            FillRect(dc, &rcBadge, brb);
+            DeleteObject(brb);
+
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, bc);
+            SetTextColor(dc, RGB(255, 255, 255));
+            HFONT f = (HFONT)GetStockObject(SYSTEM_FONT);
+            HFONT oldF = (HFONT)SelectObject(dc, f);
+            RECT rcTxt = { fx, fy + fh - 8, fx + fw, fy + fh };
+            DrawTextW(dc, badge, -1, &rcTxt, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(dc, oldF);
+        }
+    }
+
+    SelectObject(dc, oldBr);
+    SelectObject(dc, oldP);
+    DeleteObject(pen);
+}
+
+/* ---------- formatacao ---------- */
+static void ExpFormatSize(ULARGE_INTEGER sz, WCHAR *out, int cch) {
+    const ULONGLONG kb = 1024u, mb = kb * 1024u, gb = mb * 1024u;
+    if (sz.QuadPart >= gb) {
+        double v = (double)sz.QuadPart / gb;  wsprintfW(out, L"%.2f GB", v);
+    } else if (sz.QuadPart >= mb) {
+        double v = (double)sz.QuadPart / mb;  wsprintfW(out, L"%.2f MB", v);
+    } else if (sz.QuadPart >= kb) {
+        double v = (double)sz.QuadPart / kb;  wsprintfW(out, L"%.0f KB", v);
+    } else {
+        wsprintfW(out, L"%u bytes", sz.LowPart);
+    }
+}
+
+static void ExpFormatDate(FILETIME ft, WCHAR *out, int cch) {
+    SYSTEMTIME st;
+    if (!FileTimeToSystemTime(&ft, &st) || st.wYear < 1980) {
+        lstrcpynW(out, L"", cch);
+        return;
+    }
+    wsprintfW(out, L"%02d/%02d/%04d %02d:%02d",
+              st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
+}
+
+/* ---------- acesso ao estado ---------- */
+static EXPLORER *ExpGet(HWND hwnd) {
+    return (EXPLORER *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+}
+
+/* ---------- libertar listas ---------- */
+static void ExpFreeList(EXPITEM **pp, int *n, int *cap) {
+    if (*pp) free(*pp);
+    *pp = NULL;
+    *n = 0;
+    *cap = 0;
+}
+
+static void ExpClearContent(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    ExpFreeList(&e->items, &e->nItems, &e->capItems);
+    SendDlgItemMessageW(hwnd, IDX_LIST, LB_RESETCONTENT, 0, 0);
+}
+
+static void ExpClearPlaces(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    ExpFreeList(&e->places, &e->nPlaces, &e->capPlaces);
+    SendDlgItemMessageW(hwnd, IDX_SIDE, LB_RESETCONTENT, 0, 0);
+}
+
+/* acrescenta um item a uma lista dinamica; devolve o indice ou -1 */
+static int ExpPush(EXPITEM **pp, int *n, int *cap, const EXPITEM *it) {
+    if (*n >= *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        EXPITEM *np = (EXPITEM *)realloc(*pp, nc * sizeof(EXPITEM));
+        if (!np) return -1;
+        *pp = np;
+        *cap = nc;
+    }
+    (*pp)[*n] = *it;
+    return (*n)++;
+}
+
+/* ---------- comparacao para ordenacao (pastas primeiro, depois nome) ---------- */
+static EXPITEM *g_sortRef = NULL;
+
+static int ExpCmp(const void *pa, const void *pb) {
+    int a = *(const int *)pa, b = *(const int *)pb;
+    const EXPITEM *ia = &g_sortRef[a], *ib = &g_sortRef[b];
+    if (ia->isDir != ib->isDir) return ia->isDir ? -1 : 1;
+    int r = lstrcmpiW(ia->name, ib->name);
+    if (r) return r;
+    return (a > b) - (a < b);
+}
+
+/* ---------- barra lateral (locais) ---------- */
+static void ExpAddPlace(HWND hwnd, const WCHAR *label, const WCHAR *path,
+                        BOOL isDrives) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    EXPITEM p;
+    ZeroMemory(&p, sizeof(p));
+    lstrcpynW(p.name, label, MAX_PATH);
+    lstrcpynW(p.path, path ? path : L"", MAX_PATH);
+    p.isDir = TRUE;
+    p.isDrive = isDrives;
+    int idx = ExpPush(&e->places, &e->nPlaces, &e->capPlaces, &p);
+    if (idx >= 0) {
+        int pos = (int)SendDlgItemMessageW(hwnd, IDX_SIDE, LB_ADDSTRING, 0, 0);
+        SendDlgItemMessageW(hwnd, IDX_SIDE, LB_SETITEMDATA, pos, (LPARAM)idx);
+    }
+}
+
+static void ExpBuildPlaces(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    g_step = 41;
+    ExpClearPlaces(hwnd);
+    g_step = 42;
+
+    ExpAddPlace(hwnd, L"Este Computador", L"", TRUE);
+
+    WCHAR buf[MAX_PATH];
+    if (SHGetFolderPathW(NULL, CSIDL_DESKTOP, NULL, 0, buf) == S_OK && buf[0])
+        ExpAddPlace(hwnd, L"Area de Trabalho", buf, FALSE);
+    if (SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, buf) == S_OK && buf[0])
+        ExpAddPlace(hwnd, L"Documentos", buf, FALSE);
+    if (SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, buf) == S_OK && buf[0]) {
+        ExpAddPlace(hwnd, L"Perfil do Usuario", buf, FALSE);
+    }
+    if (SHGetFolderPathW(NULL, 0x000c /* CSIDL_DOWNLOADS */, NULL, 0, buf) == S_OK && buf[0]) {
+        ExpAddPlace(hwnd, L"Downloads", buf, FALSE);
+    }
+
+    WCHAR winDir[MAX_PATH];
+    GetWindowsDirectoryW(winDir, MAX_PATH);
+
+    ExpAddPlace(hwnd, L"Windows", winDir, FALSE);
+    wsprintfW(buf, L"%s\\System32", winDir);
+    if (ExpPathExists(buf)) ExpAddPlace(hwnd, L"System32", buf, FALSE);
+    wsprintfW(buf, L"%s\\System32\\Drivers", winDir);
+    if (ExpPathExists(buf)) ExpAddPlace(hwnd, L"Drivers", buf, FALSE);
+    wsprintfW(buf, L"%s\\Inf", winDir);
+    if (ExpPathExists(buf)) ExpAddPlace(hwnd, L"Inf", buf, FALSE);
+
+    /* Unidades de disco */
+    WCHAR drives[512] = {0};
+    DWORD dl = GetLogicalDriveStringsW(511, drives);
+    for (WCHAR *d = drives; dl && *d; d += lstrlenW(d) + 1) {
+        UINT type = GetDriveTypeW(d);
+        if (type < 2) continue;
+        WCHAR vol[128] = {0}, fs[32] = {0};
+        GetVolumeInformationW(d, vol, 127, NULL, NULL, NULL, fs, 31);
+        if (!vol[0])
+            lstrcpynW(vol, (type == DRIVE_FIXED) ? L"Disco Local" : L"Disco removivel", 127);
+        wsprintfW(buf, L"%s (%s)", d, vol);
+        ExpAddPlace(hwnd, buf, d, TRUE);
+    }
+}
+
+/* ---------- historico de navegacao ---------- */
+static void ExpPushHistory(HWND hwnd, const WCHAR *path) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    if (e->histPos + 1 < 64) {
+        e->histPos++;
+    } else {
+        memmove(e->hist[0], e->hist[1], 63 * sizeof(e->hist[0]));
+        e->histPos = 63;
+    }
+    lstrcpynW(e->hist[e->histPos], path, MAX_PATH);
+    e->histCount = e->histPos + 1;
+}
+
+/* ---------- barra de estado ---------- */
+static void ExpUpdateStatus(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    int nDirs = 0, nFiles = 0;
+    for (int i = 0; i < e->nItems; i++) {
+        if (e->items[i].isDir) nDirs++; else nFiles++;
+    }
+    WCHAR st[256];
+    if (e->drivesMode) {
+        wsprintfW(st, L"%d unidade(s)", e->nItems);
+    } else {
+        wsprintfW(st, L"%d pasta(s), %d ficheiro(s)", nDirs, nFiles);
+    }
+    SetDlgItemTextW(hwnd, IDX_STATUS, st);
+}
+
+/* ---------- enumerar o conteudo ---------- */
+static void ExpEnumerate(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    g_step = 6;
+    ExpClearContent(hwnd);
+    g_step = 7;
+
+    if (e->drivesMode) {
+        g_step = 8;
+        WCHAR drives[512] = {0};
+        DWORD dl = GetLogicalDriveStringsW(511, drives);
+        int count = 0;
+        for (WCHAR *d = drives; dl && *d; d += lstrlenW(d) + 1) count++;
+        EXPITEM *tmp = (EXPITEM *)calloc(count ? count : 1, sizeof(EXPITEM));
+        if (!tmp) { ExpUpdateStatus(hwnd); return; }
+
+        int n = 0;
+        for (WCHAR *d = drives; dl && *d; d += lstrlenW(d) + 1) {
+            UINT type = GetDriveTypeW(d);
+            if (type < 2) continue;
+            WCHAR vol[128] = {0}, fs[64] = {0};
+            GetVolumeInformationW(d, vol, 127, NULL, NULL, NULL, fs, 63);
+            if (!vol[0])
+                lstrcpynW(vol, (type == DRIVE_FIXED) ? L"Disco Local" : L"Disco removivel", 127);
+            wsprintfW(tmp[n].name, L"%s (%s)", d, vol);
+            lstrcpynW(tmp[n].path, d, MAX_PATH);
+            tmp[n].isDrive = TRUE;
+            tmp[n].isDir = FALSE;
+            ULARGE_INTEGER freeAvail, total, totalFree;
+            if (GetDiskFreeSpaceExW(d, &freeAvail, &total, &totalFree))
+                tmp[n].size = totalFree;
+            n++;
+        }
+
+        g_sortRef = tmp;
+        int *ord = (int *)calloc(count ? count : 1, sizeof(int));
+        if (ord) {
+            for (int i = 0; i < n; i++) ord[i] = i;
+            g_sortRef = tmp;
+            qsort(ord, n, sizeof(int), ExpCmp);
+            for (int i = 0; i < n; i++) {
+                int idx = ExpPush(&e->items, &e->nItems, &e->capItems, &tmp[ord[i]]);
+                if (idx >= 0)
+                    SendDlgItemMessageW(hwnd, IDX_LIST, LB_ADDSTRING, 0, (LPARAM)L"");
+            }
+            free(ord);
+        }
+        free(tmp);
+        ExpUpdateStatus(hwnd);
+        return;
+    }
+
+    /* Lista pastas primeiro, depois ficheiros */
+    EXPITEM *dirtmp = NULL, *filetmp = NULL;
+    int nd = 0, nf = 0, capd = 0, capf = 0;
+    WCHAR spec[MAX_PATH];
+
+    WIN32_FIND_DATAW fd;
+    for (int pass = 0; pass < 2; pass++) {
+        wsprintfW(spec, L"%s\\*", e->path);
+        HANDLE h = FindFirstFileW(spec, &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (pass == 0) {
+                e->drivesMode = TRUE;
+                lstrcpynW(e->path, L"", MAX_PATH);
+                SetDlgItemTextW(hwnd, IDX_PATH, L"");
+                ExpEnumerate(hwnd);
+            }
+            return;
+        }
+        do {
+            if (!lstrcmpW(fd.cFileName, L".") || !lstrcmpW(fd.cFileName, L"..")) continue;
+            BOOL isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if ((pass == 0) != isDir) continue;
+
+            EXPITEM cur;
+            ZeroMemory(&cur, sizeof(cur));
+            lstrcpynW(cur.name, fd.cFileName, MAX_PATH);
+            wsprintfW(cur.path, L"%s\\%s", e->path, fd.cFileName);
+            cur.attrs = fd.dwFileAttributes;
+            cur.isDir = isDir;
+            cur.size.LowPart = fd.nFileSizeLow;
+            cur.size.HighPart = fd.nFileSizeHigh;
+            cur.ft = fd.ftLastWriteTime;
+
+            EXPITEM **arr = isDir ? &dirtmp : &filetmp;
+            int *cnt = isDir ? &nd : &nf;
+            int *cp = isDir ? &capd : &capf;
+            ExpPush(arr, cnt, cp, &cur);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    /* Ordena cada grupo */
+    for (int g = 0; g < 2; g++) {
+        EXPITEM *arr = g == 0 ? dirtmp : filetmp;
+        int cnt = g == 0 ? nd : nf;
+        if (cnt > 1) {
+            int *ord = (int *)calloc(cnt, sizeof(int));
+            if (ord) {
+                for (int i = 0; i < cnt; i++) ord[i] = i;
+                g_sortRef = arr;
+                qsort(ord, cnt, sizeof(int), ExpCmp);
+                for (int i = 0; i < cnt; i++) {
+                    int idx = ExpPush(&e->items, &e->nItems, &e->capItems, &arr[ord[i]]);
+                    if (idx >= 0)
+                        SendDlgItemMessageW(hwnd, IDX_LIST, LB_ADDSTRING, 0, (LPARAM)L"");
+                }
+                free(ord);
+            }
+        } else if (cnt == 1) {
+            int idx = ExpPush(&e->items, &e->nItems, &e->capItems, &arr[0]);
+            if (idx >= 0)
+                SendDlgItemMessageW(hwnd, IDX_LIST, LB_ADDSTRING, 0, (LPARAM)L"");
+        }
+    }
+
+    if (dirtmp) free(dirtmp);
+    if (filetmp) free(filetmp);
+    ExpUpdateStatus(hwnd);
+}
+
+/* ---------- navegacao ---------- */
+static void ExpNavigate(HWND hwnd, const WCHAR *path) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e || !path) return;
+    g_step = 51;
+
+    if (!path[0]) {
+        e->drivesMode = TRUE;
+        lstrcpynW(e->path, L"", MAX_PATH);
+        SetDlgItemTextW(hwnd, IDX_PATH, L"Este Computador");
+        ExpEnumerate(hwnd);
+        return;
+    }
+
+    WCHAR clean[MAX_PATH];
+    lstrcpynW(clean, path, MAX_PATH);
+    if (!ExpPathIsDir(clean)) {
+        SetDlgItemTextW(hwnd, IDX_STATUS, L"Caminho invalido");
+        return;
+    }
+
+    e->drivesMode = FALSE;
+    lstrcpynW(e->path, clean, MAX_PATH);
+    SetDlgItemTextW(hwnd, IDX_PATH, clean);
+    ExpPushHistory(hwnd, clean);
+    ExpEnumerate(hwnd);
+
+    WCHAR title[MAX_PATH + 32];
+    const WCHAR *base = wcsrchr(clean, L'\\');
+    base = (base && base[1]) ? base + 1 : clean;
+    if (!base[0]) base = clean;
+    wsprintfW(title, L"%s - Explorador de Arquivos", base);
+    SetWindowTextW(hwnd, title);
+}
+
+static void ExpGoUp(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    if (e->drivesMode) return;
+    WCHAR parent[MAX_PATH];
+    lstrcpyW(parent, e->path);
+    WCHAR *cut = wcsrchr(parent, L'\\');
+    if (!cut) {
+        ExpNavigate(hwnd, L"");
+        return;
+    }
+    if (cut == parent) { cut[1] = 0; }   /* raiz, ex.: C:\ */
+    else { *cut = 0; }
+    ExpNavigate(hwnd, parent);
+}
+
+static void ExpGoBack(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e || e->histPos <= 0) return;
+    e->histPos--;
+    ExpNavigate(hwnd, e->hist[e->histPos]);
+}
+
+/* ---------- abrir o item selecionado ---------- */
+static void ExpOpenSelected(HWND hwnd) {
+    EXPLORER *e = ExpGet(hwnd);
+    if (!e) return;
+    HWND hList = GetDlgItem(hwnd, IDX_LIST);
+    int sel = (int)SendMessageW(hList, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= e->nItems) return;
+
+    const EXPITEM *it = &e->items[sel];
+    if (it->isDrive || it->isDir) {
+        if (it->path[0]) ExpNavigate(hwnd, it->path);
+        else ExpNavigate(hwnd, L"");
+        return;
+    }
+    /* ficheiro: abre com a associacao do sistema */
+    ShellExecuteW(hwnd, L"open", it->path, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* ---------- subclass da lista para teclas ---------- */
+static LRESULT CALLBACK ExpListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    g_lastMsg = msg; g_lastWp = (unsigned)wParam;
+    WNDPROC old = (WNDPROC)GetPropW(hwnd, L"ExpOldProc");
+    if (msg == WM_KEYDOWN) {
+        HWND parent = GetParent(hwnd);
+        if (wParam == VK_RETURN)      { ExpOpenSelected(parent); return 0; }
+        if (wParam == VK_BACK) { ExpGoUp(parent); return 0; }
+        if (wParam == VK_F5)          { HWND p = parent; ExpEnumerate(p); return 0; }
+    }
+    if (old) return CallWindowProcW(old, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* ---------- subclass da caixa do caminho para Enter ---------- */
+static LRESULT CALLBACK ExpPathProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    g_lastMsg = msg; g_lastWp = (unsigned)wParam;
+    WNDPROC old = (WNDPROC)GetPropW(hwnd, L"ExpOldProc");
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        WCHAR buf[MAX_PATH];
+        GetWindowTextW(hwnd, buf, MAX_PATH);
+        if (buf[0]) ExpNavigate(GetParent(hwnd), buf);
+        return 0;
+    }
+    if (old) return CallWindowProcW(old, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* ---------- reposicionar os controlos ---------- */
+static void ExpLayout(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+
+    MoveWindow(GetDlgItem(hwnd, IDX_BACK),   6, 6, 58, 30, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_UP),     68, 6, 58, 30, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_HOME),  130, 6, 58, 30, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_REFRESH),192, 6, 58, 30, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_PATH),   258, 6, w - 258 - 46, 30, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_GO),     w - 44, 6, 38, 30, TRUE);
+
+    int top = EXP_TOOLBAR_H;
+    int bot = h - EXP_STATUS_H;
+    MoveWindow(GetDlgItem(hwnd, IDX_SIDE), 0, top, EXP_SIDE_W, bot - top, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_LIST), EXP_SIDE_W, top, w - EXP_SIDE_W, bot - top, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDX_STATUS), 0, bot, w, EXP_STATUS_H, TRUE);
+}
+
+/* ---------- WndProc do explorador ---------- */
+static LRESULT CALLBACK ExpWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_step = 1;
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+        EXPLORER *e = (EXPLORER *)calloc(1, sizeof(EXPLORER));
+        if (!e) return -1;
+        e->cascade = 0;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)e);
+
+        HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+        g_step = 2;
+
+        CreateWindowW(L"BUTTON", L"Voltar", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_BACK, inst, NULL);
+        CreateWindowW(L"BUTTON", L"Acima", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_UP, inst, NULL);
+        CreateWindowW(L"BUTTON", L"Inicio", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_HOME, inst, NULL);
+        CreateWindowW(L"BUTTON", L"Atualizar", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_REFRESH, inst, NULL);
+
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_PATH, inst, NULL);
+
+        CreateWindowW(L"BUTTON", L"Ir", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_GO, inst, NULL);
+
+        /* Painel de locais */
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_SIDE, inst, NULL);
+
+        /* Lista de conteudo */
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_LIST, inst, NULL);
+
+        CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_SUNKEN,
+            0, 0, 1, 1, hwnd, (HMENU)(UINT_PTR)IDX_STATUS, inst, NULL);
+
+        /* subclasse da caixa do caminho */
+        {
+            HWND hPath = GetDlgItem(hwnd, IDX_PATH);
+            WNDPROC old = (WNDPROC)SetWindowLongPtrW(hPath, GWLP_WNDPROC, (LONG_PTR)ExpPathProc);
+            SetPropW(hPath, L"ExpOldProc", (HANDLE)old);
+        }
+        /* subclasse da lista */
+        {
+            HWND hList = GetDlgItem(hwnd, IDX_LIST);
+            WNDPROC old = (WNDPROC)SetWindowLongPtrW(hList, GWLP_WNDPROC, (LONG_PTR)ExpListProc);
+            SetPropW(hList, L"ExpOldProc", (HANDLE)old);
+        }
+        g_step = 3;
+
+        ExpBuildPlaces(hwnd);
+        g_step = 4;
+        ExpLayout(hwnd);
+        g_step = 5;
+
+        /* Pasta inicial */
+        if (cs && cs->lpCreateParams) {
+            ExpNavigate(hwnd, (const WCHAR *)cs->lpCreateParams);
+        } else {
+            WCHAR winDir[MAX_PATH];
+            GetWindowsDirectoryW(winDir, MAX_PATH);
+            if (winDir[0]) ExpNavigate(hwnd, winDir);
+            else ExpNavigate(hwnd, L"");
+        }
+        break;
+    }
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT mis = (LPMEASUREITEMSTRUCT)lParam;
+        mis->itemHeight = EXP_ITEM_H;
+        return TRUE;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lParam;
+        if (di->CtlType != ODT_LISTBOX) break;
+        EXPLORER *e = ExpGet(hwnd);
+
+        if (di->CtlID == IDX_LIST) {
+            if (!e || di->itemID < 0 || di->itemID >= e->nItems) break;
+            const EXPITEM *it = &e->items[di->itemID];
+            BOOL sel = (di->itemState & ODS_SELECTED) != 0;
+
+            RECT rc = di->rcItem;
+            HBRUSH bg = CreateSolidBrush(sel ? E_SEL : E_LISTBG);
+            FillRect(di->hDC, &rc, bg);
+            DeleteObject(bg);
+
+            int y = rc.top + (rc.bottom - rc.top - EXP_ICON_H) / 2;
+            const WCHAR *ext = (it->isDir || it->isDrive) ? NULL : ExpExtFor(it->name);
+            DrawExpIcon(di->hDC, rc.left + 6, y, EXP_ICON_H, it->isDir, it->isDrive, ext);
+
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, sel ? RGB(255, 255, 255) : E_TEXT);
+            HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT oldF = (HFONT)SelectObject(di->hDC, f);
+
+            RECT rcName = { rc.left + 32, rc.top, rc.right - 190, rc.bottom };
+            DrawTextW(di->hDC, it->name, -1, &rcName,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS);
+
+            WCHAR meta[96] = {0};
+            if (it->isDrive && it->size.QuadPart) {
+                WCHAR s[32];
+                ExpFormatSize(it->size, s, 32);
+                wsprintfW(meta, L"livre %s", s);
+            } else if (it->isDrive || it->isDir) {
+                lstrcpynW(meta, L"Pasta", 32);
+            } else {
+                WCHAR s[32], d[32];
+                ExpFormatSize(it->size, s, 32);
+                ExpFormatDate(it->ft, d, 32);
+                wsprintfW(meta, L"%s   %s", s, d);
+            }
+            RECT rcMeta = { rc.right - 190, rc.top, rc.right - 8, rc.bottom };
+            DrawTextW(di->hDC, meta, -1, &rcMeta,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(di->hDC, oldF);
+            return TRUE;
+        }
+
+        if (di->CtlID == IDX_SIDE) {
+            if (!e || di->itemID < 0 || di->itemID >= e->nPlaces) break;
+            const EXPITEM *pl = &e->places[di->itemID];
+            BOOL sel = (di->itemState & ODS_SELECTED) != 0;
+
+            RECT rc = di->rcItem;
+            HBRUSH bg = CreateSolidBrush(sel ? E_SEL : E_BG);
+            FillRect(di->hDC, &rc, bg);
+            DeleteObject(bg);
+
+            int y = rc.top + (rc.bottom - rc.top - EXP_ICON_H) / 2;
+            DrawExpIcon(di->hDC, rc.left + 6, y, EXP_ICON_H, TRUE, pl->isDrive, NULL);
+
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, sel ? RGB(255, 255, 255) : E_TEXT);
+            HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT oldF = (HFONT)SelectObject(di->hDC, f);
+            RECT rcTxt = { rc.left + 32, rc.top, rc.right - 6, rc.bottom };
+            DrawTextW(di->hDC, pl->name, -1, &rcTxt,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS);
+            SelectObject(di->hDC, oldF);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, E_TEXT);
+        SetBkColor(dc, E_LISTBG);
+        static HBRUSH lbBrush = NULL;
+        if (!lbBrush) lbBrush = CreateSolidBrush(E_LISTBG);
+        return (LRESULT)lbBrush;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        if (id == IDX_BACK)    { ExpGoBack(hwnd); return 0; }
+        if (id == IDX_UP)      { ExpGoUp(hwnd); return 0; }
+        if (id == IDX_HOME)    { ExpNavigate(hwnd, L""); return 0; }
+        if (id == IDX_REFRESH) { ExpEnumerate(hwnd); return 0; }
+        if (id == IDX_GO) {
+            WCHAR buf[MAX_PATH];
+            GetDlgItemTextW(hwnd, IDX_PATH, buf, MAX_PATH);
+            if (buf[0]) ExpNavigate(hwnd, buf);
+            return 0;
+        }
+        if (id == IDX_LIST && code == LBN_DBLCLK) {
+            ExpOpenSelected(hwnd);
+            return 0;
+        }
+        if (id == IDX_SIDE && code == LBN_DBLCLK) {
+            EXPLORER *e = ExpGet(hwnd);
+            int sel = (int)SendDlgItemMessageW(hwnd, IDX_SIDE, LB_GETCURSEL, 0, 0);
+            if (e && sel >= 0 && sel < e->nPlaces) {
+                const EXPITEM *pl = &e->places[sel];
+                if (pl->path[0]) ExpNavigate(hwnd, pl->path);
+                else ExpNavigate(hwnd, L"");
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_SIZE:
+        ExpLayout(hwnd);
+        break;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY: {
+        EXPLORER *e = ExpGet(hwnd);
+        if (e) {
+            ExpFreeList(&e->items, &e->nItems, &e->capItems);
+            ExpFreeList(&e->places, &e->nPlaces, &e->capPlaces);
+            RemovePropW(GetDlgItem(hwnd, IDX_LIST), L"ExpOldProc");
+            RemovePropW(GetDlgItem(hwnd, IDX_PATH), L"ExpOldProc");
+            free(e);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    }
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+/* ---------- Abrir uma nova janela do explorador ---------- */
+static void OpenFileExplorer(const wchar_t *startPath) {
+    WCHAR title[MAX_PATH + 48] = L"Explorador de Arquivos";
+    if (startPath && startPath[0]) {
+        const WCHAR *base = wcsrchr(startPath, L'\\');
+        base = (base && base[1]) ? base + 1 : startPath;
+        wsprintfW(title, L"%s - Explorador de Arquivos", base);
+    }
+
+    /* Copia do caminho inicial para o lpCreateParams */
+    WCHAR *param = NULL;
+    if (startPath && startPath[0]) {
+        size_t n = lstrlenW(startPath) + 1;
+        param = (WCHAR *)malloc(n * sizeof(WCHAR));
+        if (param) lstrcpynW(param, startPath, (int)n);
+    }
+
+    int cw = 860, ch = 560;
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (cw > sw - 20) cw = sw - 20;
+    if (ch > sh - TASKBAR_H - 20) ch = sh - TASKBAR_H - 20;
+    int cx = (sw - cw) / 2 + ((g_expCascade++ % 6) - 3) * 24;
+    int cy = (sh - TASKBAR_H - ch) / 2 + ((g_expCascade % 6) - 3) * 24;
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+
+    HWND h = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        L"WinPEExplorerClass", title,
+        WS_OVERLAPPEDWINDOW,
+        cx, cy, cw, ch,
+        NULL, NULL, GetModuleHandleW(NULL), param);
+
+    if (param) free(param);
+
+    if (h) {
+        ShowWindow(h, SW_SHOW);
+        UpdateWindow(h);
+        SetForegroundWindow(h);
+    }
+}
+
+/* ---------- Diagnostico de crash (WinPE) ----------
+   Quando uma excecao nao tratada mata o processo, o WinPE reinicia (o shell
+   sai). Este filtro mostra o endereco da falha numa caixa de dialogo, para
+   poder ser lido numa captura de tela e convertido com addr2line. */
+typedef struct {
+    DWORD code;
+    void *addr;
+    void *base;
+    ULONG_PTR info[2];     /* AV: [0] tipo (0=read,1=write), [1] endereco do dado */
+    DWORD nParams;
+    WCHAR module[96];      /* modulo que contem o endereco da instrucao */
+    ULONG_PTR modBase;     /* base do modulo da instrucao */
+    ULONG_PTR dataModBase; /* modulo que contem o endereco do dado */
+    WCHAR dataMod[96];
+    ULONG_PTR rcx, rdx, r8, r9;
+    ULONG_PTR rsp, retAddr;
+    WCHAR retMod[96];
+    ULONG_PTR retBase;
+} CRASHINFO;
+static CRASHINFO g_crash;
+
+static void ExpModName(void *addr, WCHAR *out, int cch, ULONG_PTR *baseOut) {
+    HMODULE m = NULL;
+    out[0] = 0;
+    if (baseOut) *baseOut = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &m) && m) {
+        GetModuleFileNameW(m, out, cch);
+        /* deixa so o nome do ficheiro */
+        WCHAR *b = out, *p;
+        for (p = out; *p; p++) if (*p == L'\\' || *p == L'/') b = p + 1;
+        if (b != out) { memmove(out, b, (lstrlenW(b) + 1) * sizeof(WCHAR)); }
+        if (baseOut) *baseOut = (ULONG_PTR)m;
+    } else {
+        lstrcpynW(out, L"<desconhecido>", cch);
+    }
+}
+
+static DWORD WINAPI CrashBoxThread(LPVOID p) {
+    CRASHINFO *c = (CRASHINFO *)p;
+    char modA[96] = {0}, datA[96] = {0}, retA[96] = {0};
+    WideCharToMultiByte(CP_ACP, 0, c->module, -1, modA, 95, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, c->dataMod, -1, datA, 95, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, c->retMod, -1, retA, 95, NULL, NULL);
+    char buf[768];
+    wsprintfA(buf,
+        "codigo   = %08X\n"
+        "endereco = %s + 0x%X\n"
+        "dados    = %p %s\n"
+        "chamada de %s + 0x%X\n"
+        "passo    = %d\n"
+        "msg      = %04X wp=%X\n"
+        "evento   = %s",
+        c->code,
+        modA,
+        (unsigned)(c->modBase ? ((ULONG_PTR)c->addr - c->modBase) : 0),
+        (void *)c->info[1],
+        (c->nParams > 0) ? ((c->info[0] ? "escrita" : "leitura")) : "",
+        retA,
+        (unsigned)(c->retBase ? (c->retAddr - c->retBase) : 0),
+        g_step, g_lastMsg, g_lastWp, g_dbg);
+    MessageBoxA(NULL, buf, "menu_iniciar: excecao capturada",
+                MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
+    return 0;
+}
+
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *info) {
+    g_crash.code = info->ExceptionRecord->ExceptionCode;
+    g_crash.addr = info->ExceptionRecord->ExceptionAddress;
+    g_crash.base = GetModuleHandleW(NULL);
+    g_crash.nParams = info->ExceptionRecord->NumberParameters;
+    g_crash.info[0] = info->ExceptionRecord->NumberParameters > 0
+                      ? info->ExceptionRecord->ExceptionInformation[0] : 0;
+    g_crash.info[1] = info->ExceptionRecord->NumberParameters > 1
+                      ? info->ExceptionRecord->ExceptionInformation[1] : 0;
+    ExpModName(g_crash.addr, g_crash.module, 96, &g_crash.modBase);
+    ExpModName((void *)g_crash.info[1], g_crash.dataMod, 96, &g_crash.dataModBase);
+    g_crash.rcx = info->ContextRecord->Rcx;
+    g_crash.rdx = info->ContextRecord->Rdx;
+    g_crash.r8  = info->ContextRecord->R8;
+    g_crash.r9  = info->ContextRecord->R9;
+    g_crash.rsp = info->ContextRecord->Rsp;
+
+    /* Percorre a pilha a procura de enderecos que pertencem ao proprio exe:
+       esses sao os "frames" nossos e seus offsets viram linha de codigo no
+       addr2line. Guarda o primeiro (frame mais recente). */
+    g_crash.retAddr = 0;
+    g_crash.retBase = 0;
+    g_crash.retMod[0] = 0;
+    ULONG_PTR exeBase = (ULONG_PTR)g_crash.base;
+    ULONG_PTR exeSize = 0;
+    {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)exeBase;
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(exeBase + dos->e_lfanew);
+        exeSize = nt->OptionalHeader.SizeOfImage;
+    }
+    for (int i = 0; i < 256 && !g_crash.retAddr; i++) {
+        ULONG_PTR v = *(ULONG_PTR *)(g_crash.rsp + (ULONG_PTR)i * 8);
+        if (v >= exeBase && v < exeBase + exeSize) {
+            g_crash.retAddr = v;
+        }
+    }
+    if (g_crash.retAddr) {
+        g_crash.retBase = exeBase;
+        lstrcpynW(g_crash.retMod, L"menu_iniciar.exe", 96);
+    }
+    /* thread nova com pilha propria: necessario se o crash for stack overflow */
+    HANDLE h = CreateThread(NULL, 0x100000, CrashBoxThread, &g_crash, 0, NULL);
+    if (h) { WaitForSingleObject(h, 60000); CloseHandle(h); }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
+    SetUnhandledExceptionFilter(CrashFilter);
+
+    /* 1. Classe da Barra de Tarefas */
+    WNDCLASSW wcTb = {0};
+    wcTb.lpfnWndProc = TaskbarWndProc;
+    wcTb.hInstance = hInstance;
+    wcTb.lpszClassName = L"WinPETaskbarClass";
+    wcTb.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wcTb.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!RegisterClassW(&wcTb)) return 1;
+
+    /* 1b. Classe do Explorador de Arquivos */
+    WNDCLASSW wcExp = {0};
+    wcExp.lpfnWndProc = ExpWndProc;
+    wcExp.hInstance = hInstance;
+    wcExp.lpszClassName = L"WinPEExplorerClass";
+    wcExp.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wcExp.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcExp.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!RegisterClassW(&wcExp)) return 1;
+
+    /* 2. Classe do Menu Iniciar */
+    WNDCLASSW wcMenu = {0};
+    wcMenu.lpfnWndProc = MenuWndProc;
+    wcMenu.hInstance = hInstance;
+    wcMenu.lpszClassName = L"MenuIniciarClass";
+    wcMenu.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    g_bgBrush = CreateSolidBrush(C_BG);
+    wcMenu.hbrBackground = g_bgBrush;
+    wcMenu.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!RegisterClassW(&wcMenu)) return 1;
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    /* 3. Cria a Barra de Tarefas fixa na parte inferior */
+    g_hwndTaskbar = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"WinPETaskbarClass", L"Taskbar",
+        WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        0, screenH - TASKBAR_H, screenW, TASKBAR_H,
+        NULL, NULL, hInstance, NULL);
+    if (!g_hwndTaskbar) return 1;
+
+    /* 4. Cria a janela do Menu Iniciar (inicialmente oculta) */
+    int menuW = (WIN_W > screenW - 20) ? (screenW - 20) : WIN_W;
+    int menuH = (WIN_H > screenH - TASKBAR_H - 10) ? (screenH - TASKBAR_H - 10) : WIN_H;
+    int menuX = 0;
+    int menuY = screenH - TASKBAR_H - menuH;
+
+    g_hwndMenu = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"MenuIniciarClass", L"Menu Iniciar",
+        WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        menuX, menuY, menuW, menuH,
+        g_hwndTaskbar, NULL, hInstance, NULL);
+    if (!g_hwndMenu) return 1;
+
+    ShowWindow(g_hwndMenu, SW_HIDE);
+    ShowWindow(g_hwndTaskbar, SW_SHOW);
+    UpdateWindow(g_hwndTaskbar);
+
+    /* Atalhos globais:
+        Ctrl+Esc / Win -> Menu Iniciar (via hook de teclado LL: RegisterHotKey
+                          falha para essas combinacoes no WinPE)
+        Win+E          -> Explorador de Arquivos (RegisterHotKey funciona) */
+    RegisterHotKey(g_hwndTaskbar, 101, MOD_WIN, 'E');
+    g_hKbdHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                   GetModuleHandleW(NULL), 0);
+
+    /* Teste/diagnostico: "menu_iniciar.exe exp" abre logo o explorador */
+    if (lpCmdLine && strstr(lpCmdLine, "exp")) {
+        OpenFileExplorer(NULL);
+    }
+
+    /* Loop de mensagens */
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_hMouseHook) {
+        UnhookWindowsHookEx(g_hMouseHook);
+    }
+    if (g_hKbdHook) {
+        UnhookWindowsHookEx(g_hKbdHook);
+    }
+    UnregisterHotKey(g_hwndTaskbar, 101);
+    if (g_bgBrush) DeleteObject(g_bgBrush);
+
+    return (int)msg.wParam;
+}
