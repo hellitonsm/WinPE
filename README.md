@@ -75,6 +75,30 @@ x86_64-w64-mingw32-gcc wpetool/source/menu_iniciar.c \
 ./run-winpe-amd64.sh WinPE_menu.iso
 ```
 
+## Shell estilo LiberNT / Windows 11
+
+`wpetool/source/explorer.c` é o shell usado hoje no lugar do `menu_iniciar.exe`.
+Ele traz wallpaper azul com ícones na área de trabalho, taskbar escura com logo
+azul de quatro quadrados, ícones de rede/volume e relógio `h:mm AM/PM`, Menu
+Iniciar arredondado e Explorador de Arquivos com faixa de abas.
+
+```bash
+# Recompilar o shell (MinGW-w64)
+x86_64-w64-mingw32-gcc wpetool/source/explorer.c \
+  -o wpetool/templates/explorer.exe -mwindows -O2
+
+# Gerar uma ISO com esse visual
+./wpetool/wpe-tool.sh workdir WinPE_amd64.iso wpe-look
+cp wpetool/templates/explorer.exe wpe-look/Windows/System32/
+./wpetool/wpe-tool.sh settemplate wpe-look/Windows/System32
+./wpetool/wpe-tool.sh build wpe-look WinPE_libernt_look.iso
+```
+
+> O `explorer.exe` pré-compilado do LiberNT **não** roda no WinPE: ele importa
+> ordinais privados do ReactOS (`shell32`/`shlwapi`/`explorerframe`) e exige
+> chaves de registry que o WinPE não tem. Por isso o shell é uma implementação
+> Win32 própria, com as mesmas importações do `menu_iniciar.exe`.
+
 ## Ajustes no BCD
 
 ```bash

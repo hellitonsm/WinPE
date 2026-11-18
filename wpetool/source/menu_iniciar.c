@@ -948,12 +948,12 @@ static void Launch(const wchar_t *cmd, const wchar_t *args) {
 }
 
 static void DoPower(int id) {
+    /* No WinPE, ExitWindowsEx(EWX_POWEROFF) costuma causar reboot em vez de
+       desligar. Usar wpeutil.exe (nativo do WinPE) para desligar/reiniciar. */
     if (id == ID_POWEROFF) {
         ShellExecuteW(NULL, L"open", L"wpeutil.exe", L"shutdown", NULL, SW_HIDE);
-        ExitWindowsEx(EWX_POWEROFF | EWX_FORCE, 0);
     } else if (id == ID_REBOOT) {
         ShellExecuteW(NULL, L"open", L"wpeutil.exe", L"reboot", NULL, SW_HIDE);
-        ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
     }
 }
 

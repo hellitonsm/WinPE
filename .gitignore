@@ -1,1 +1,9 @@
 *.iso
+
+# Binários de teste/driver dentro do LiberNT (não versionados)
+LiberNT/drivers/network/dd/netr28ux/RaCoInstx.dll
+LiberNT/modules/rostests/apitests/ntdll/shell32.dll
+LiberNT/modules/rostests/apitests/ntdll/test.dll
+LiberNT/modules/rostests/apitests/user32/cpimg2e.exe
+LiberNT/modules/rostests/apitests/user32/image.dll
+LiberNT/modules/rostests/testdata/test.dll

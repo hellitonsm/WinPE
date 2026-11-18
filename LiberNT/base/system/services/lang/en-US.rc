@@ -1,0 +1,16 @@
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+STRINGTABLE
+BEGIN
+    IDS_SERVICE_START   "start"
+    IDS_SERVICE_STOP    "stop"
+    IDS_SERVICE_PAUSE   "pause"
+    IDS_SERVICE_RESUME  "resume"
+    IDS_SERVICE_RUNNING "Running"
+    IDS_SERVICE_STOPPED "Stopped"
+    IDS_SERVICE_PAUSED  "Paused"
+    IDS_RECOVERY_NONE        "No action"
+    IDS_RECOVERY_RESTART     "Restart the service"
+    IDS_RECOVERY_REBOOT      "Restart the computer"
+    IDS_RECOVERY_RUN_COMMAND "Run the configured recovery program"
+END
