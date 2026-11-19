@@ -1,0 +1,37 @@
+#pragma code_page(65001)
+#include <windows.h>
+
+LANGUAGE LANG_PORTUGUESE, SUBLANG_PORTUGUESE_BRAZILIAN
+1 ICON "assets/azul.ico"
+1 RT_MANIFEST "assets/azul.manifest"
+101 RCDATA "assets/parede.dib"
+102 RCDATA "assets/icones.bgra"
+103 RCDATA "assets/Inter-Regular.otf"
+104 RCDATA "assets/Inter-SemiBold.otf"
+
+1 VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041604B0"
+        BEGIN
+            VALUE "FileDescription", "Azul PE - Shell para Windows PE\0"
+            VALUE "FileVersion", "1.0.0\0"
+            VALUE "InternalName", "AzulPE\0"
+            VALUE "OriginalFilename", "AzulPE.exe\0"
+            VALUE "ProductName", "Azul PE\0"
+            VALUE "ProductVersion", "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x416, 1200
+    END
+END

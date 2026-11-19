@@ -7,3 +7,12 @@ LiberNT/modules/rostests/apitests/ntdll/test.dll
 LiberNT/modules/rostests/apitests/user32/cpimg2e.exe
 LiberNT/modules/rostests/apitests/user32/image.dll
 LiberNT/modules/rostests/testdata/test.dll
+
+# Pastas de trabalho do wpetool / gerador da imagem Azul PE (temporárias)
+wpe-azul/
+wpe-azul-shell/
+.wpetool-work/
+
+# Saídas de build do Azul PE (fontes, assets e captura ficam versionados)
+AzulPE/AzulPE.exe
+AzulPE/obj/

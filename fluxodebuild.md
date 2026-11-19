@@ -13,3 +13,13 @@ x86_64-w64-mingw32-gcc wpetool/source/menu_iniciar.c -o wpetool/templates/menu_i
 
 # 4. Rodar a ISO gerada
 ./run-winpe-amd64.sh WinPE_menu.iso
+
+# ---------------------------------------------------------------
+# Fluxo do Azul PE (SEPARADO do processo acima)
+# O Azul PE nao usa os templates/menu deste fluxo. Gere a ISO com o
+# AzulPE como shell padrao (winpeshl.ini -> wpeinit + AzulPE.exe)
+# pelo script proprio:
+cd AzulPE
+./gerar-imagem-azul.sh ../WinPE_amd64.iso ../WinPE_azul.iso
+# Obs: nao rode 'settemplate' depois de injetar o Azul PE — ele sobrescreve
+# o winpeshl.ini e o explorer-x64 volta a ser o shell da imagem.
